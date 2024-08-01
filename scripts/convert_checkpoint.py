@@ -7,9 +7,9 @@ from tensorrt_llm._utils import release_gc
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models import LLaMAForCausalLM
 
 from config import BuildParam
+from quantization import LLaMAForCausalLMWrapper
 
 
 def args_to_quantization(
@@ -42,6 +42,7 @@ def convert(
     model_dir: str,
     output_dir: str,
     calib_dataset: str = None,
+    num_samplers: int = 512,
     sq_value: float = None,
 ) -> None:
     q_config = args_to_quantization(p.build_type, use_int8kv, sq_value)
@@ -51,11 +52,12 @@ def convert(
                           rank=-1,
                           tp_size=p.tp_size,
                           pp_size=p.pp_size)
-        LLaMAForCausalLM.quantize(model_dir,
+        LLaMAForCausalLMWrapper.quantize(model_dir,
                                   output_dir,
-                                  q_config,
                                   mapping=mapping,
-                                  calib_dataset=calib_dataset)
+                                  quant_config=q_config,
+                                  calib_dataset=calib_dataset,
+                                  num_samplers=num_samplers)
     else:
         hf_model = AutoModelForCausalLM.from_pretrained(model_dir,
                                                         device_map="auto",
@@ -67,11 +69,10 @@ def convert(
                               rank=rank,
                               tp_size=tp_size,
                               pp_size=pp_size)
-            llama = LLaMAForCausalLM.from_hugging_face(
-                model_dir,
+            llama = LLaMAForCausalLMWrapper.from_hugging_face(
+                model_dir if hf_model is None else hf_model,
                 mapping=mapping,
-                quantization=q_config,
-                preloaded_model=hf_model)
+                quant_config=q_config)
             llama.save_checkpoint(output_dir, save_config=(rank == 0))
             del llama
 

@@ -12,6 +12,8 @@ from tensorrt_llm.runtime import ModelConfig
 from tensorrt_llm.runtime.generation import (_Runtime, KVCacheManager,
                                              GenerationSequence, RuntimeTensor,
                                              Mapping)
+from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
+from tensorrt_llm._ipc_utils import set_peer_access
 from tensorrt_llm._utils import trt_dtype_to_torch, str_dtype_to_torch
 from transformers import AutoTokenizer, PreTrainedTokenizer
 from typing import List, Tuple, Dict
@@ -39,6 +41,15 @@ class GenerationSession(object):
             math.ceil(self.model_config.vocab_size / self.mapping.tp_size) *
             self.mapping.tp_size)
         self.num_attn_layers = self.model_config.num_layers
+
+        if self.use_custom_all_reduce and self.mapping.tp_size > 1:
+            set_peer_access(self.mapping)
+            self.ipc_buffers, self.all_reduce_ws = \
+                CustomAllReduceHelper.allocate_workspace(
+                    self.mapping,
+                    CustomAllReduceHelper.max_workspace_size_auto(
+                        self.mapping.tp_size)
+                )
 
     def _tensor_dtype(self, name):
         return trt_dtype_to_torch(self.runtime.engine.get_tensor_dtype(name))
@@ -85,44 +96,6 @@ class GenerationSession(object):
         last_token_ids = torch.cumsum(last_token_ids, dim=0).int()
 
         return position_ids, last_token_ids
-
-    def _prepare_context_inputs(
-        self,
-        batch_size: int,
-        context_lengths: torch.Tensor,
-        host_context_lengths: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        last_token_ids = context_lengths.detach().clone()
-        last_token_ids = torch.cumsum(last_token_ids, dim=0).int()
-        ret = {'last_token_ids': last_token_ids}
-
-        position_ids = torch.concat([
-            torch.arange(0,
-                         host_context_lengths[i],
-                         dtype=torch.int32,
-                         device='cuda') for i in range(batch_size)
-        ])
-
-        if self.model_config.has_position_embedding:
-            ret['position_ids'] = position_ids
-
-        return ret
-
-    def _prepare_generation_inputs(
-        self,
-        context_lengths: torch.Tensor,
-        step: int,
-    ) -> Dict[str, torch.Tensor]:
-        last_token_ids = torch.ones_like(context_lengths)
-        last_token_ids = torch.cumsum(last_token_ids, dim=0).int()
-        ret = {"last_token_ids": last_token_ids}
-
-        position_ids = context_lengths + step
-
-        if self.model_config.has_position_embedding:
-            ret["position_ids"] = position_ids
-
-        return ret
 
     def setup(
         self,
@@ -192,6 +165,10 @@ class GenerationSession(object):
     @property
     def paged_kv_cache(self):
         return self.model_config.paged_kv_cache
+
+    @property
+    def use_custom_all_reduce(self):
+        return self.model_config.use_custom_all_reduce
 
     @property
     def hidden_size(self):
@@ -282,6 +259,9 @@ class GenerationSession(object):
             if self.removing_input_padding:
                 add_tensor(host_context_lengths, "host_context_lengths")
 
+        if self.use_custom_all_reduce and self.mapping.tp_size > 1:
+            add_tensor(self.all_reduce_ws, "all_reduce_workspace")
+
         return tensors
 
     @staticmethod
@@ -325,6 +305,13 @@ class GenerationSession(object):
                 host_kv_cache_block_offsets=host_kv_cache_block_offsets,
                 step=step,
                 is_prefill=is_prefill)
+            
+            if self.mapping.rank == 0:
+                print(">>>>>> step=", step)
+                for k, v in tensors.items():
+                    print(f"{k}={v.to_torch()}")
+                    print(f"{k}.shape={v.to_torch().shape}")
+                print()
             self.runtime._set_tensors(context, tensors)
 
             stream = torch.cuda.current_stream().cuda_stream
@@ -474,7 +461,7 @@ class ModelRunner(object):
 
         max_batch_size = build_config.max_batch_size
         max_input_len = build_config.max_input_len
-        max_output_len = build_config.max_output_len
+        max_seq_len = build_config.max_seq_len
         max_beam_width = build_config.max_beam_width
         model_config = ModelConfig(
             max_batch_size=build_config.max_batch_size,
@@ -492,7 +479,8 @@ class ModelRunner(object):
             head_size=head_size,
             tokens_per_block=build_config.plugin_config.tokens_per_block,
             quant_mode=pretrained_config.quant_mode,
-            dtype=pretrained_config.dtype)
+            dtype=pretrained_config.dtype,
+            use_custom_all_reduce=build_config.plugin_config.use_custom_all_reduce)
 
         torch.cuda.set_device(rank % pretrained_config.mapping.gpus_per_node)
 
@@ -502,7 +490,7 @@ class ModelRunner(object):
         return cls(session=session,
                    max_batch_size=max_batch_size,
                    max_input_len=max_input_len,
-                   max_seq_len=max_input_len + max_output_len,
+                   max_seq_len=max_seq_len,
                    max_beam_width=max_beam_width)
 
     @classmethod
@@ -583,6 +571,7 @@ if __name__ == "__main__":
     with torch.no_grad():
         output_ids = runner.generate(batch_input_ids=batch_input_ids,
                                      max_new_tokens=args.max_new_tokens)
+        torch.cuda.synchronize()
     # 4. print output
     if runtime_rank == 0:
         output_ids = output_ids.tolist()

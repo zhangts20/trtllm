@@ -1,4 +1,5 @@
 images
 __pycache__
 .vscode
-tests
+test_scripts
+build

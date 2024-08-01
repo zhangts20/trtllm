@@ -1,23 +1,34 @@
 import os
+import copy
 import torch
 import traceback
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
+from multiprocessing import get_context
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from tensorrt_llm.builder import BuildConfig, Engine, build
-from tensorrt_llm.models.modeling_utils import PretrainedConfig, load_model
+from tensorrt_llm.models.modeling_utils import PretrainedConfig 
+from tensorrt_llm.models.llama.model import LLaMAForCausalLM
 
 from config import BuildParam
 
 
-def build_model(model_dir: str, output_dir: str, build_config: BuildConfig,
+def build_model(model_dir: str, build_config: BuildConfig,
                 model_config: PretrainedConfig, rank: int) -> Engine:
+    
+
+    rank_config = copy.deepcopy(model_config)
+    rank_config.set_rank(rank)
+    model = LLaMAForCausalLM.from_checkpoint(model_dir, config=rank_config) 
+
+    build_config = copy.deepcopy(build_config)
+    return build(model, build_config)
+
+
+def build_and_save(model_dir, output_dir, build_config,
+                         model_config, rank):
     torch.cuda.set_device(rank)
 
-    model_config = PretrainedConfig.from_json_file(
-        os.path.join(model_dir, "config.json"))
-    model = load_model(model_config, model_dir)
-
-    engine = build(model, build_config)
+    engine = build_model(model_dir, build_config, model_config, rank)
     assert engine is not None
     engine.save(output_dir)
 
@@ -25,7 +36,7 @@ def build_model(model_dir: str, output_dir: str, build_config: BuildConfig,
 def export(p: BuildParam, model_dir: str, output_dir: str) -> None:
     build_config = BuildConfig.from_dict({
         "max_input_len": p.max_input_length,
-        "max_output_len": p.max_output_length,
+        "max_seq_len": p.max_input_length + p.max_output_length,
         "max_batch_size": p.max_batch_size,
         "max_beam_width": p.max_beam_width,
         "max_num_tokens": p.max_batch_size * p.max_input_length,
@@ -38,13 +49,13 @@ def export(p: BuildParam, model_dir: str, output_dir: str) -> None:
     max_workers = min(torch.cuda.device_count(), p.tp_size * p.pp_size)
     if max_workers == 1:
         for rank in range(p.tp_size * p.pp_size):
-            build_model(model_dir, output_dir, build_config, model_config,
+            build_and_save(model_dir, output_dir, build_config, model_config,
                         rank)
     else:
-        with ProcessPoolExecutor(max_workers=max_workers) as e:
+        with ProcessPoolExecutor(mp_context=get_context("spawn"), max_workers=max_workers) as e:
             futures = [
-                e.submit(build_model, model_dir, output_dir, build_config,
-                         model_config, rank) for rank in p.tp_size * p.pp_size
+                e.submit(build_and_save, model_dir, output_dir, build_config,
+                         model_config, rank) for rank in range(p.tp_size * p.pp_size)
             ]
             expections = []
             for future in as_completed(futures):

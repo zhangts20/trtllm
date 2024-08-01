@@ -2,10 +2,11 @@ import os
 import argparse
 
 from tempfile import TemporaryDirectory
+
 from convert_checkpoint import convert
 from export_engine import export
 from config import BuildParam
-from utils import replace_function, copy_tokenizer
+from utils import copy_tokenizer
 
 
 def main(p: BuildParam) -> None:
@@ -27,9 +28,6 @@ def main(p: BuildParam) -> None:
     if not os.path.exists(output_dir):
         os.mkdir(output_dir)
 
-    # replace modules
-    replace_function()
-
     temp_dir = TemporaryDirectory(dir=args.root_dir)
     # 0. Convert Weights
     convert(p,
@@ -37,6 +35,7 @@ def main(p: BuildParam) -> None:
             model_dir,
             output_dir=temp_dir.name,
             calib_dataset=args.calib_dataset,
+            num_samplers=args.num_samplers,
             sq_value=args.sq_value)
 
     # 1. Export Engine
@@ -96,6 +95,10 @@ def parser_args():
     parser.add_argument("--calib-dataset",
                         type=str,
                         help="The calibration dataset used in int8 kv.")
+    parser.add_argument("--num-samplers",
+                    type=int,
+                    default=512,
+                    help="The number of dataset for calibration.")
 
     return parser.parse_args()
 
